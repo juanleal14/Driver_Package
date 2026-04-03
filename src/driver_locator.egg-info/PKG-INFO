@@ -1,0 +1,253 @@
+Metadata-Version: 2.4
+Name: driver-locator
+Version: 0.1.0
+Summary: Driver tracking and nearest-driver lookup package.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: hypothesis>=6.100.0; extra == "dev"
+Requires-Dist: mypy>=1.0; extra == "dev"
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: ruff>=0.6.0; extra == "dev"
+
+# driver-locator
+
+A Python package that tracks active drivers and returns the closest one to a target location.
+
+Designed for **clarity first**: simple domain modeling, explicit validation, deterministic behavior, and pluggable nearest-neighbor indexing.
+
+---
+
+## Quick start
+
+```bash
+pip install -e ".[dev]"
+python scripts/demo.py
+```
+
+## API
+
+```python
+from driver_locator.models import Location
+from driver_locator.service import DriverLocator
+
+locator = DriverLocator()
+
+locator.upsert_driver("driver_a", Location(0.0, 0.0))
+locator.upsert_driver("driver_b", Location(3.0, 4.0))
+
+closest = locator.find_closest_driver(Location(1.0, 1.0))  # → "driver_a"
+
+locator.upsert_driver("driver_a", Location(99.0, 99.0))    # update location
+locator.stop_tracking("driver_b")                          # idempotent
+
+# Plug in the grid index for large fleets
+from driver_locator.indexes.grid import GridDriverIndex
+grid_locator = DriverLocator(index=GridDriverIndex(cell_size=50.0))
+```
+
+### Operations
+
+| Method | Description | Raises |
+|---|---|---|
+| `upsert_driver(id, location)` | Add or update a tracked driver | `InvalidDriverIdError`, `InvalidLocationError` |
+| `stop_tracking(id)` | Stop tracking a driver. No-op for unknown ids | `InvalidDriverIdError` |
+| `find_closest_driver(location)` | Closest tracked driver (ties → lex-min id) | `NoDriversAvailableError`, `InvalidLocationError` |
+
+---
+
+## Design decisions
+
+### Dependency Inversion via Protocols
+
+`DriverLocator` depends on `DriverIndex` and `DriverRepository` **protocols**, not on concrete types.
+Swapping to a Redis-backed repository or a k-d tree index requires no changes to the service layer.
+
+Both protocols are `@runtime_checkable`, which enables `isinstance` assertions in tests and
+defensive guards without imposing an inheritance hierarchy.
+
+### Pluggable spatial index
+
+The index strategy is injected at construction time.  The default is `NaiveDriverIndex`
+(predictable, zero tuning), with `GridDriverIndex` available as a drop-in for large fleets.
+Adding a third strategy (e.g. k-d tree) requires implementing three methods and passing an
+instance to the constructor — nothing else changes.
+
+### Distance metric: squared Euclidean
+
+The spec calls for Euclidean distance.  All comparisons use **squared** distance to avoid
+unnecessary `sqrt` operations — the ordering is identical and the operation is strictly cheaper.
+
+### Determinism: lexicographic tie-breaking
+
+When two drivers are equidistant, the lexicographically smallest `driver_id` wins.
+This is enforced at the index level, so both `NaiveDriverIndex` and `GridDriverIndex`
+produce identical results for any input — verified by Hypothesis property tests.
+
+### Separate `_utils.py` for shared math
+
+`squared_distance` lives in `indexes/_utils.py`, not in either index implementation.
+This prevents `grid.py` from importing `naive.py` (an implementation-to-implementation
+dependency that would break if either module were refactored).
+
+### Input validation at the service boundary only
+
+Validation (`InvalidDriverIdError`, `InvalidLocationError`) happens once, in `DriverLocator`.
+The index and repository layers trust their callers and skip redundant checks.
+
+---
+
+## Assumptions
+
+- Coordinates are 2D Cartesian floats (`x`, `y`).  No geographic coordinate system is assumed.
+- Driver IDs are non-empty strings; leading/trailing whitespace is stripped at the input boundary.
+- `stop_tracking` for an unknown driver is a no-op (idempotent by design).
+- `find_closest_driver` raises `NoDriversAvailableError` when the fleet is empty.
+- `InMemoryDriverRepository` is single-threaded.  Concurrent access requires an external lock
+  or a thread-safe backend implementing `DriverRepository`.
+
+---
+
+## Complexity
+
+### NaiveDriverIndex
+
+| Operation | Time |
+|---|---|
+| `upsert` | O(1) |
+| `remove` | O(1) |
+| `find_closest` | O(n) |
+
+### GridDriverIndex
+
+| Operation | Time (average) |
+|---|---|
+| `upsert` | O(1) |
+| `remove` | O(1) |
+| `find_closest` | Sub-linear (see below) |
+
+**Early-termination argument.**  After fully scanning ring `r` (r ≥ 1), every driver
+in ring `r+1` and beyond is at Euclidean distance ≥ `r · cell_size` from the query point.
+If `(r · cell_size)² > best_squared_distance`, no remaining ring can improve the result and
+the loop exits.  For a uniformly distributed fleet with a well-chosen `cell_size`, the
+expected number of rings scanned is O(1), giving O(drivers_per_cell) per query on average.
+Worst case (all drivers equidistant, or all packed in one cell) remains O(n).
+
+**Choosing `cell_size`.**  Target ~4 drivers per cell:
+
+```
+cell_size ≈ sqrt(4 · area / n_drivers)
+```
+
+For a ±5 000 coordinate space with 10 000 drivers: `sqrt(4 · 10⁸ / 10 000) ≈ 200`.
+
+---
+
+## Performance
+
+Benchmark: 1 000 queries, uniform random distribution over `[-5000, 5000]²`.
+
+| Fleet size | Naive (ms) | Grid (ms) | Speedup |
+|---:|---:|---:|---:|
+| 1 000 | ~13 | ~2 | ~6× |
+| 5 000 | ~65 | ~3 | ~22× |
+| 10 000 | ~130 | ~3 | ~43× |
+| 50 000 | ~650 | ~4 | ~160× |
+
+*Run `python scripts/benchmark.py` to reproduce on your machine.*
+
+---
+
+## Trade-offs
+
+| | NaiveDriverIndex | GridDriverIndex |
+|---|---|---|
+| Simplicity | ✅ Zero tuning | ⚠ Requires `cell_size` |
+| Predictability | ✅ Always O(n) | ⚠ Worst case O(n) |
+| Average performance | ❌ Linear always | ✅ Sub-linear |
+| Memory | ✅ One dict | ⚠ Two extra dicts |
+| Code complexity | ✅ ~20 lines | ⚠ ~90 lines |
+
+The naive index is the right default for small fleets or when worst-case latency
+matters more than average throughput.  The grid index is the right choice when
+fleet size is large and drivers are spatially distributed.
+
+---
+
+## Repository layout
+
+```
+src/driver_locator/
+  __init__.py
+  models.py              # DriverId, Location, Driver
+  exceptions.py          # DriverLocatorError hierarchy
+  service.py             # DriverLocator — public API
+  py.typed               # PEP 561 marker
+  indexes/
+    protocol.py          # DriverIndex Protocol
+    _utils.py            # squared_distance (shared math)
+    naive.py             # NaiveDriverIndex — O(n) scan
+    grid.py              # GridDriverIndex — expanding-ring + early exit
+    __init__.py
+  repositories/
+    protocol.py          # DriverRepository Protocol
+    in_memory.py         # InMemoryDriverRepository
+    __init__.py
+tests/
+  conftest.py            # shared fixtures
+  test_service.py        # happy-path and edge-case service tests
+  test_validation.py     # input validation tests
+  test_indexes_equivalence.py  # Hypothesis: grid == naive under all inputs
+  test_protocol_compliance.py  # runtime and static protocol verification
+scripts/
+  demo.py                # end-to-end walkthrough
+  benchmark.py           # naive vs grid timing table
+.github/workflows/ci.yml
+pyproject.toml
+README.md
+```
+
+---
+
+## Testing
+
+```bash
+# All tests (unit + property-based)
+pytest -q
+
+# With verbose Hypothesis output
+pytest -q --hypothesis-show-statistics
+```
+
+Tests cover:
+
+- **Unit**: all public operations, edge cases, tie-breaking, whitespace trimming.
+- **Validation**: blank ids, non-string ids, NaN/inf coordinates, wrong types.
+- **Protocol compliance**: both index implementations and the repository satisfy their
+  protocols at runtime and statically (mypy strict).
+- **Property-based** (Hypothesis, 200–400 examples each):
+  - Grid matches naive after bulk upsert.
+  - Grid matches naive after arbitrary upsert/delete sequences.
+  - Grid with `cell_size=0.1` (many rings, heavy early-termination pressure) matches naive.
+  - Removed drivers never appear as closest — for both index types.
+
+---
+
+## Linting and type checking
+
+```bash
+ruff format --check .
+ruff check .
+mypy src/           # strict mode
+```
+
+---
+
+## Future improvements
+
+- **Thread-safe variants** — a `threading.Lock`-wrapped repository for concurrent use.
+- **Geographic coordinates** — swap Euclidean for Haversine behind the distance interface.
+- **Incremental `max_radius`** — maintain the Chebyshev radius of the farthest cell during
+  upsert/remove to eliminate the O(cells) precomputation in `GridDriverIndex.find_closest`.
+- **Persistence adapters** — Redis or PostgreSQL implementations behind `DriverRepository`.
+- **Configurable metrics** — timing/tracing hooks injected via a thin middleware layer.
